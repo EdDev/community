@@ -257,6 +257,52 @@ VMI status and in one case to pass the data (processed) to the
 
 - DownwardAPI
 
+##### Device Info
+
+In some cases the multus status annotation
+contains [device-info](https://github.com/k8snetworkplumbingwg/device-info-spec/blob/main/SPEC.md).
+This info may be valuable for the binding plugin sidecar. For example
+`SRIOV` and `VDPA` plugins need this info.
+
+As the multus status annotation is not there yet on `virt-launcher` pod
+creation, the suggested solution is to use downwardAPI volume and mount
+it to the sidecar.
+The downwardAPI volume will track a new `virt-launcher` pod
+annotation `kubevirt.io/network-device-info-map` that will contain a
+mapping between the logical network name to the `device-info` of this
+network.
+Very similar to the
+existing [SRIOV downwardAPI](https://github.com/kubevirt/kubevirt/pull/8226)
+solution which is mapping the networkName to the `pci-address` of the
+device and mounting the downwardAPI volume to the `virt-launcher` pod.
+
+> **Note**: Old multus versions may not report the device-info.
+
+Alternatives:
+
+- Instead of configuring in the kubevirt CR whether deviceInfo should be
+  mounted to the sidecar or not we can always mount it in case it exists
+  in the status.
+- Share via the downwardAPI only the deviceInfo of binding that request
+  it. It can be controlled by the binding config in the kubivirt CR
+  (e.g. `deviceInfo: true/false` attribute).
+- Passing `PCIDEVICE_<RESOURCE_NAME>_NET_INFO` env var from the
+  `virt-launcher` to the sidecar by adding it as an annotation to the
+  vmi object passed to the onDefineDomain method. The problem with this
+  approach is that it will reintroduce the
+  same [bug](https://github.com/kubevirt/kubevirt/issues/7444) SRIOV
+  that the SRIOV downward API solved.
+-
+
+Sharing [CNIDeviceInfo](https://github.com/k8snetworkplumbingwg/device-info-spec/blob/main/SPEC.md#5-new-cni-plugin-arguments)
+file with the sidecar. It is a very similar approach to the
+downwardAPI option, the disadvantage here is that the user would have
+to specify the file path in the `NetworkAttachmentDefinition`.
+
+Additional alternatives to a similar issue are listed in the SRIOV
+mapping
+design [doc](https://github.com/kubevirt/community/blob/main/design-proposals/sriov-interfaces-mapping.md).
+
 #### Run services in the virt-launcher pod
 
 - Use the existing sidecar hook which KubeVirt currently supports.
@@ -941,3 +987,152 @@ Libvirt configuration snippet:
     <rom enabled='no'/>
 </interface>
 ```
+
+## Appendix F: Concrete example for vDPA binding
+
+Present a concrete example of the actions needed at each integration
+point, considering the option suggested in the
+[design section](#design-details).
+
+### Kubevirt CR Specification
+
+The sriov-binding is registered to the Kubevirt CR.
+The plugin is then referenced by name from the VM Specification.
+
+> **Note**: The vDPA binding does not need to perform changes in the
+> pod network, therefore, there is no need for a
+> network-attachment-definition.
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: KubeVirt
+metadata:
+  name: kubevirt
+  namespace: kubevirt
+spec:
+  configuration:
+    network:
+      binding:
+        vdpa:
+          sidecarImage: quay.io/kubevirt/network-vdpa-binding
+```
+
+### VM Specification
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: vmi-1-bridge
+spec:
+  template:
+    spec:
+      domain:
+        devices:
+          interfaces:
+            - name: blue
+              mac: 12:34:56:78:9a:bc
+              binding:
+                name: vdpa
+      networks:
+        - name: blue
+          multus:
+            networkName: vdpa-network
+```
+
+### NetworkAttachmentDefinition Specification
+
+Not required for vDPA binding
+
+> **Note**: Just to clarify, a NAD is required for the vDPA CNI and
+> device plugin, but it is not in the scope of this doc. An extra NAD
+> for
+> the network binding plugin is not required.
+
+### Webhook Admitter
+
+- The core KubeVirt admitter assures that only one method of binding
+  definition is possible: Either the old style method or the new one.
+- No addmiter is provided as part of the vDPA binding.
+
+### Pod Definition
+
+The VMI controller updates the pod manifest per the VMI specification.
+
+- From the VMI spec, the following snippet is detected:
+
+```yaml
+name: blue
+binding:
+  name: vdpa
+```
+
+- As a result, the pod is updated with the following annotations & spec:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: virt-launcher-123
+  annotations:
+    kubevirt.io/network-device-info-map: '{
+      blue:
+        "device-info": {
+          "type": "vdpa",
+          "version": "1.1.0",
+          "vdpa": {
+            "parent-device": "vdpa:0000:65:00.3",
+            "driver": "vhost",
+            "path": "/dev/vhost-vdpa-1",
+            "pci-address": "0000:65:00.3"
+          }
+        }
+    }'
+  spec:
+    containers:
+      - name: compute
+
+      - name: hook-sidecar-1
+        volumeMounts:
+          - name: network-device-info-map
+            mountPath: /etc/pod-info
+    volumes:
+      - name: network-device-info-map
+        downwardAPI:
+          items:
+            - path: device-info
+              fieldRef:
+                fieldPath: metadata.annotations[kubevirt.io/network-device-info-map]
+```
+
+### Configure Pod network namespace
+
+Not required for vDPA binding
+
+### Reacting to CNI results (Multus status annotation)
+
+Device info from the multus status annotation will be propagated to the
+sidecar using downwardAPI. The data will be used to compose the libvirt
+domain xml interface.
+
+### Run services in the virt-launcher pod
+
+Not required for vDPA binding
+
+### Domain definition & creation
+
+A sidecar will be introduced to add the vDPA interfaces to the libvirt
+domain.
+
+Libvirt configuration snippet:
+
+```xml
+<interface type='vdpa'>
+    <driver name='vfio'/>
+    <source dev='/dev/vhost-vdpa-0 network=default'/>
+      <alias name='ua-blue'/>
+      <address type='pci' domain='0x0000' bus='0x65' slot='0x00' function='0x2'/>
+</interface>
+```
+
+- The domain itself is created by the `virt-launcher`.
